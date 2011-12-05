@@ -1,0 +1,2 @@
+recursive-include donelist/public *
+recursive-include donelist/templates *

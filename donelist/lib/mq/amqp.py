@@ -1,0 +1,206 @@
+from pylons import g
+from amqplib import client_0_8 as amqp
+from Queue import Queue
+from threading import local, Thread
+log = g.log
+amqp_host = g.amqp_host
+amqp_user = g.amqp_user
+amqp_pass = g.amqp_pass
+amqp_exchange = 'donelist_exchange'
+amqp_virtual_host = g.amqp_virtual_host
+amqp_logging = g.amqp_logging
+import socket
+from datetime import datetime
+import sys, time
+class Worker:
+    '''Singleton class used to connect to rabbitmq
+
+    Define a daemon thread in the init to get method from queue and then exec it .
+    The method in the thread is that which is used to put msg to rabbitmq''' 
+    def __init__(self):
+        self.q = Queue()
+        self.t = Thread(target=self._handle)
+        self.t.setDaemon(True)
+        self.t.start()
+
+    def _handle(self):
+        '''Get methods from queue to exec'''
+        while True:
+            fn = self.q.get()
+            try:
+                fn()
+                self.q.task_done()
+            except:
+                import traceback
+                print traceback.format_exc()
+
+    def do(self, fn, *a, **kwargs):
+        fn1 = lambda: fn(*a, **kwargs)
+        self.q.put(fn1)
+
+    def join(self):
+        self.t.join()
+
+worker=Worker()
+
+class ConnectionManager(local):
+    '''Use a local parent class to store localthread data'''
+    def __init__(self):
+        self.connection = None
+        self.channel = None
+        self.have_init = False
+
+    def get_connection(self):
+        while not self.connection:
+            try:
+                self.connection = amqp.Connection(host = amqp_host,
+                                                  userid = amqp_user,
+                                                  password = amqp_pass,
+                                                  virtual_host = amqp_virtual_host,
+                                                  insist = False)
+            except ( socket.error, IOError), e:
+                print 'error connecting to amqp %s @ %s (%r)' % (amqp_user, amqp_host, e)
+                time.sleep(1)
+
+        if not self.have_init:
+            self.init_queue()
+            self.have_init = True
+
+        return self.connection
+
+    def get_channel(self,reconnect = False):
+        if self.connection and self.connection.channels is None:
+            log.error("Error: amqp.py, connection object with no available channels.")
+            self.connection = None
+
+        if not self.connection or reconnect:
+            self.connection = None
+            self.channel = None
+            self.get_connection()
+
+        if not self.channel:
+            self.channel = self.connection.channel()
+
+        return self.channel
+            
+
+    def init_queue(self):
+        from donelist.lib.mq.queues import DonelistQueueMap
+
+        channel = self.get_channel()
+        DonelistQueueMap(amqp_exchange, channel).init()
+        
+connection_manager = ConnectionManager()
+
+DELIBERY_TRANSIENT = 1 #rabbitmq no write to disk
+DELIVERY_DURABLE = 2  #rabbmitmq's exchange/queques can recover when rebbot rabbmitmq
+def _add_item(routing_key, body,message_id = None,
+              delivery_mode = DELIVERY_DURABLE):
+    if not amqp_host:
+        log.error("error: Ingoring amqp message %r to %r" % (body, routing_key))
+        return
+    channel = connection_manager.get_channel()
+    msg = amqp.Message(body,
+                       timestamp = datetime.now(),
+                       delivery_mode = delivery_mode)
+    if message_id:
+        msg.properties['message_id'] = message_id
+
+    try:
+        channel.basic_publish(msg,
+                              exchange = amqp_exchange,
+                              routing_key = routing_key)
+    except Exception as e:
+        if e.errno == errno.EPIPE:
+            connection_manager.get_channel(True)
+            add_item(routing_key, body,message_id)
+        else:
+            raise
+
+def add_item(routing_key, body,message_id = None, delivery_mode =DELIVERY_DURABLE):
+    if amqp_host and amqp_logging:
+        log.debug("amqp: adding item %r to %r" % (body, routing_key))
+
+    worker.do(_add_item, routing_key, body, message_id = message_id,delivery_mode = delivery_mode)
+
+def add_kw(routing_key, ** kw):
+    add_item(routing_key, pickle.dumps(kw))
+
+def consume_items(queue, callback, verbose=True):
+    channel = connection_manager.get_channel()    
+    def _callback(msg):
+        '''Add some stat and call the callback param.'''
+
+        if verbose:
+            count_str = ''
+            if 'message_count' in msg.delivery_info:
+                count_str = '(%d remaining)' % msg.delivery_info['message_count']
+
+            print "%s: 1 item %s" % (queue, count_str)
+
+        ret = callback(msg)
+        msg.channel.basic_ack(msg.delivery_tag)
+        sys.stdout.flush()
+        return ret
+    channel.basic_consume(queue=queue, callback=_callback)
+    try:
+        while channel.callbacks:
+            try:
+                channel.wait()
+            except keyboardInterrupt:
+                break
+    finally:
+        worker.join()
+        if channel.is_open:
+            channel.close()
+
+def handle_items(queue, callback, ack = True,limit =1, drain = False,verbose = True,sleep_time =1 ):
+
+    channel = connection_manager.get_channel()
+    countdown = None
+    while True:
+        if countdown == 0:
+            break
+        msg = channel.basic_get(queue)
+        if not msg and drain:
+            return
+        elif not msg:
+            time.sleep(sleep_time)
+            continue
+
+        if countdown is None and drain and 'message_count' in msg.delivery_info:
+            countdown = 1 + msg.delivery_info['message_count']
+
+        items = []
+
+        while msg and countdown !=0:
+            items.append(msg)
+            if countdown is not None:
+                countdown -=1
+            if len(items)>=limit:
+                break
+            msg=channel.basic_get(queue)
+        try:
+            count_str = ''
+            if 'message_count' in items[-1].delivery_info:
+                count_str = '(%d remaining)' % items[-1].delivery_info['message_count']
+            if verbose:
+                print "%s: %d items %s" % (queue, len(items), count_str)
+            callback(items)
+
+            if ack:
+                channel.basic_ack(0,multiple=True)
+
+            sys.stdout.flush()
+        except:
+            for item in items:
+                channel.basic_reject(item.delivery_tag, requeue =True)
+            raise
+
+def _test_setup(test_q = 'test_q'):
+    from donelist.lib.mq.queues import DonelistQueueMap
+    channel = connection_manager.get_channel()
+    dqm=DonelistQueueMap(amqp_exchange, channel)
+    dqm._q(test_q,durable=False, auto_delete=True,self_refer=True)
+    return channel
+

@@ -1,0 +1,441 @@
+import logging
+from pylons import g
+LOG_FILE="/home/wizard/ubuntu-one/donelist/log.log"
+from donelist.lib.mq import log as log2
+from donelist.lib.mq import amqp
+from donelist.lib.base import *
+import cPickle as pickle
+import sys
+log = logging.getLogger(__name__)
+log.addHandler(logging.FileHandler(LOG_FILE))
+log.setLevel(logging.INFO)
+class FormsController(BaseController):
+
+        
+    def index(self):
+        @g.stats.amqp_processor("log_q")
+        def handle(msg):
+            for msgs in msg:
+                print "msg%s" % pickle.loads(msgs.body)
+        
+        # log2.log_text('formscontroller')
+        # amqp.handle_items("log_q",handle,verbose = False)
+
+        # Return a rendered template
+        #   return render('/some/template.mako')
+        # or, Return a response
+        return 'Hello World' 
+    def GET_password(self):
+        log.info("in_password")
+        """The 'what is my password' page"""
+        return BoringPage(_("password"), content=Password()).render()
+class Templated(object):
+    """
+    Replaces the Wrapped class (which has now a subclass and which
+    takes an thing to be wrapped).
+
+    Templated objects are suitable for rendering and caching, with a
+    render loop desgined to fetch other cached templates and insert
+    them into the current template.
+
+    """
+
+    # is this template cachable (see CachedTemplate)
+    cachable = False
+    # attributes that will not be made into the cache key
+    cache_ignore = set()
+
+    def __repr__(self):
+        return "<Templated: %s>" % self.__class__.__name__
+    
+    def __init__(self, **context):
+        """
+        uses context to init __dict__ (making this object a bit like a storage)
+        """
+        for k, v in context.iteritems():
+            setattr(self, k, v)
+        if not hasattr(self, "render_class"):
+            self.render_class = self.__class__
+
+    def _notfound(self, style):
+        from pylons import g, request
+        from pylons.controllers.util import abort
+        from r2.lib.log import log_text
+        if g.debug:
+            raise NotImplementedError (repr(self), style)
+        else:
+            if style == 'png':
+                level = "debug"
+            else:
+                level = "warning"
+            log_text("missing template",
+                     "Couldn't find %s template for %r %s" %
+                      (style, self, request.path),
+                     level)
+            abort(404)
+
+    def template(self, style = 'html'):
+        """
+        Fetches template from the template manager
+        """
+        from r2.config.templates import tpm
+        from pylons import g
+
+        debug = g.template_debug
+        template = None
+        try:
+            template = tpm.get(self.render_class,
+                               style, cache = not debug)
+        except AttributeError:
+            self._notfound(style)
+        return template
+
+    def cache_key(self, *a):
+        """
+        if cachable, this function is used to generate the cache key. 
+        """
+        raise NotImplementedError
+
+    def render_nocache(self, attr, style):
+        """
+        No-frills (or caching) rendering of the template.  The
+        template is returned as a subclass of StringTemplate and
+        therefore finalize() must be called on it to turn it into its
+        final form
+        """
+        from filters import unsafe
+        from pylons import c
+
+        # the style has to default to the global render style
+        # fetch template
+        template = self.template(style)
+        if template:
+            # store the global render style (since child templates)
+            render_style = c.render_style
+            c.render_style = style
+            # are we doing a partial render?
+            if attr:
+                template = template.get_def(attr)
+            # render the template
+            res = template.render(thing = self)
+            if not isinstance(res, StringTemplate):
+                res = StringTemplate(res)
+            # reset the global render style
+            c.render_style = render_style
+            return res
+        else:
+            self._notfound(style)
+
+    def _render(self, attr, style, **kwargs):
+        """
+        Renders the current template with the current style, possibly
+        doing a part_render if attr is not None.
+
+        if this is the first template to be rendered, it is will track
+        cachable templates, insert stubs for them in the output,
+        get_multi from the cache, and render the uncached templates.
+        Uncached but cachable templates are inserted back into the
+        cache with a set_multi.
+
+        NOTE: one of the interesting issues with this function is that
+        on each newly rendered thing, it is possible that that
+        rendering has in turn cause more cachable things to be
+        fetched.  Thus the first template to be rendered runs a loop
+        and keeps rendering until there is nothing left to render.
+        Then it updates the master template until it doesn't change.
+
+        NOTE 2: anything passed in as a kw to render (and thus
+        _render) will not be part of the cached version of the object,
+        and will substituted last.
+        """
+        from pylons import c, g
+        style = style or c.render_style or 'html'
+        # prepare (and store) the list of cachable items. 
+        primary = False
+        if not isinstance(c.render_tracker, dict):
+            primary = True
+            c.render_tracker = {}
+        
+        # insert a stub for cachable non-primary templates
+        if self.cachable:
+            res = CacheStub(self, style)
+            cache_key = self.cache_key(attr, style)
+            # in the tracker, we need to store:
+            #  The render cache key (res.name)
+            #  The memcached cache key(cache_key)
+            #  who I am (self) and what am I doing (attr, style) with what
+            #  (kwargs)
+            c.render_tracker[res.name] = (cache_key, (self,
+                                                      (attr, style, kwargs)))
+        else:
+            # either a primary template or not cachable, so render it
+            res = self.render_nocache(attr, style)
+
+        # if this is the primary template, let the caching games begin
+        if primary:
+            # updates will be the (self-updated) list of all of
+            # the cached templates that have been cached or
+            # rendered.
+            updates = {}
+            # to_cache is just the keys of the cached templates
+            # that were not in the cache.
+            to_cache = set([])
+            while c.render_tracker:
+                # copy and wipe the tracker.  It'll get repopulated if
+                # any of the subsequent render()s call cached objects.
+                current = c.render_tracker
+                c.render_tracker = {}
+    
+                # do a multi-get.  NOTE: cache keys are the first item
+                # in the tuple that is the current dict's values.
+                # This dict cast will generate a new dict of cache_key
+                # to value
+                cached = self._read_cache(dict(current.values()))
+                # replacements will be a map of key -> rendered content
+                # for updateing the current set of updates
+                replacements = {}
+
+                new_updates = {}
+                # render items that didn't make it into the cached list
+                for key, (cache_key, others) in current.iteritems():
+                    # unbundle the remaining args
+                    item, (attr, style, kw) = others
+                    if cache_key not in cached:
+                        # this had to be rendered, so cache it later
+                        to_cache.add(cache_key)
+                        # render the item and apply the stored kw args
+                        r = item.render_nocache(attr, style)
+                    else:
+                        r = cached[cache_key]
+                    # store the unevaluated templates in
+                    # cached for caching
+                    replacements[key] = r.finalize(kw)
+                    new_updates[key] = (cache_key, (r, kw))
+                        
+                # update the updates so that when we can do the
+                # replacement in one pass.
+                
+                # NOTE: keep kw, but don't update based on them.
+                # We might have to cache these later, and we want
+                # to have things like $child present.
+                for k in updates.keys():
+                    cache_key, (value, kw) = updates[k]
+                    value = value.update(replacements)
+                    updates[k] = cache_key, (value, kw)
+
+                updates.update(new_updates)
+    
+            # at this point, we haven't touched res, but updates now
+            # has the list of all the updates we could conceivably
+            # want to make, and to_cache is the list of cache keys
+            # that we didn't find in the cache.
+
+            # cache content that was newly rendered
+            _to_cache = {}
+            for k, (v, kw) in updates.values():
+                if k in to_cache:
+                    _to_cache[k] = v
+            self._write_cache(_to_cache)
+    
+            # edge case: this may be the primary tempalte and cachable
+            if isinstance(res, CacheStub):
+                res = updates[res.name][1][0]
+                
+            # now we can update the updates to make use of their kw args.
+            _updates = {}
+            for k, (foo, (v, kw)) in updates.iteritems():
+                _updates[k] = v.finalize(kw)
+            updates = _updates
+
+            # update the response to use these values
+            # replace till we can't replace any more. 
+            npasses = 0
+            while True:
+                npasses += 1
+                r = res
+                res = res.update(kwargs).update(updates)
+                semi_final = res.finalize()
+                if r.finalize() == res.finalize():
+                    res = semi_final
+                    break
+                
+            # wipe out the render tracker object
+            c.render_tracker = None
+        elif not isinstance(res, CacheStub):
+            # we're done.  Update the template based on the args passed in
+            res = res.finalize(kwargs)
+        
+        return res
+
+    def _cache_key(self, key):
+        return 'render_%s(%s)' % (self.__class__.__name__,
+                                  md5(key).hexdigest())
+
+    def _write_cache(self, keys):
+        from pylons import g
+
+        if not keys:
+            return
+
+        toset = {}
+        for key, val in keys.iteritems():
+            toset[self._cache_key(key)] = val
+
+        g.rendercache.set_multi(toset)
+
+    def _read_cache(self, keys):
+        from pylons import g
+
+        ekeys = {}
+        for key in keys:
+            ekeys[self._cache_key(key)] = key
+        found = g.rendercache.get_multi(ekeys)
+        ret = {}
+        for fkey, val in found.iteritems():
+            ret[ekeys[fkey]] = val
+        return ret
+
+    def render(self, style = None, **kw):
+        from r2.lib.filters import unsafe
+        res = self._render(None, style, **kw)
+        return unsafe(res) if isinstance(res, str) else res
+        
+    def part_render(self, attr, **kw):
+        style = kw.get('style')
+        if style: del kw['style']
+        return self._render(attr, style, **kw)
+
+
+def responsive(res, space_compress = False):
+    """
+    Use in places where the template is returned as the result of the
+    controller so that it becomes compatible with the page cache.
+    """
+    # if is_api():
+    #     res = json_respond(res)
+    #     if c.allowed_callback:
+    #         res = "%s(%s)" % (websafe_json(c.allowed_callback), res)
+    # elif space_compress:
+    #     res = spaceCompress(res)
+    c.response.content = res
+    return c.response
+
+class Reddit(Templated):
+    '''Base class for rendering a page on reddit.  Handles toolbar creation,
+    content of the footers, and content of the corner buttons.
+
+    Constructor arguments:
+
+        space_compress -- run r2.lib.filters.spaceCompress on render
+        loginbox -- enable/disable rendering of the small login box in the right margin
+            (only if no user is logged in; login box will be disabled for a logged in user)
+        show_sidebar -- enable/disable content in the right margin
+
+            infotext -- text to display in a <p class="infotext"> above the content
+        nav_menus -- list of Menu objects to be shown in the area below the header
+        content -- renderable object to fill the main content well in the page.
+
+    settings determined at class-declaration time
+
+        create_reddit_box -- enable/disable display of the "Create a reddit" box
+        submit_box        -- enable/disable display of the "Submit" box
+        searchbox         -- enable/disable the "search" box in the header
+        extension_handling -- enable/disable rendering using non-html templates
+            (e.g. js, xml for rss, etc.)
+    '''
+
+    create_reddit_box  = True
+    submit_box         = True
+    footer             = True
+    searchbox          = True
+    extension_handling = True
+    enable_login_cover = True
+    site_tracking      = True
+    show_firsttext     = True
+    additional_css     = None
+
+    def __init__(self, space_compress = True, nav_menus = None, loginbox = True,
+                 infotext = '', content = None, title = '', robots = None, 
+                 show_sidebar = True, footer = True, srbar = True,
+                 **context):
+        Templated.__init__(self, **context)
+        self.title          = title
+        self.robots         = robots
+        self.infotext       = infotext
+        self.loginbox       = True
+        self.show_sidebar   = show_sidebar
+        self.space_compress = space_compress
+        # instantiate a footer
+        #-- self.footer         = RedditFooter() if footer else None
+
+        #put the sort menus at the top
+        #-- self.nav_menu = MenuArea(menus = nav_menus) if nav_menus else None
+
+        #add the infobar
+        self.infobar = None
+        # generate a canonical link for google
+        self.canonical_link = request.fullpath
+        if c.render_style != "html":
+            #-- u = UrlParser(request.fullpath)
+            u.set_extension("")
+            u.hostname = g.domain
+            if g.domain_prefix:
+                u.hostname = "%s.%s" % (g.domain_prefix, u.hostname)
+            self.canonical_link = u.unparse()
+        if self.show_firsttext and not infotext:
+            if g.read_only_mode:
+                infotext = strings.read_only_msg
+            elif (c.firsttime == 'mobile_suggest' and
+                  c.render_style != 'compact'):
+                infotext = strings.iphone_first
+            elif c.firsttime and c.site.firsttext:
+                infotext = c.site.firsttext
+        #-- if infotext:
+            #-- self.infobar = InfoBar(message = infotext)
+
+        self.srtopbar = None
+
+    def render(self, *a, **kw):
+        """Overrides default Templated.render with two additions
+            * support for rendering API requests with proper wrapping
+            * support for space compression of the result
+        In adition, unlike Templated.render, the result is in the form of a pylons
+        Response object with it's content set.
+        """
+        res = Templated.render(self, *a, **kw)
+        return responsive(res, self.space_compress)
+
+  
+    def __repr__(self):
+        return "<Reddit>"
+
+  
+
+
+
+
+class BoringPage(Reddit):
+    """parent class For rendering all sorts of uninteresting,
+    sortless, navless form-centric pages.  The top navmenu is
+    populated only with the text provided with pagename and the page
+    title is 'reddit.com: pagename'"""
+
+    extension_handling= False
+
+    def __init__(self, pagename, **context):
+        self.pagename = pagename
+        name = c.site.name or g.default_sr
+        if "title" not in context:
+            context['title'] = "%s: %s" % (name, pagename)
+
+        Reddit.__init__(self, **context)
+
+    # def build_toolbars(self):
+        #--- return [PageNameNav('nomenu', title = self.pagename)]
+
+
+#datefmt = _force_utf8(_('%d %b %Y'))
+
+# def get_captcha():
+#     if not c.user_is_loggedin or c.user.needs_captcha():
+#         return get_iden()

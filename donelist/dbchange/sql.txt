@@ -1,0 +1,21 @@
+create database donelist character set utf8;
+use donelist;
+CREATE TABLE user (
+	aid INT(14) NOT NULL AUTO_INCREMENT,
+	name varchar(20) NOT NULL,
+	pwd varchar(20) NOT NULL,
+	birthday varchar(20),
+	add_time timestamp not null default current_timestamp,
+	PRIMARY KEY p_user (aid)
+) TYPE = innoDB COMMENT ='' default charset=utf8;
+
+
+CREATE TABLE type_list (
+	aid INT(14) NOT NULL AUTO_INCREMENT,
+	user_id int(14) not null ,
+	content varchar(20000),
+	add_time timestamp not null default current_timestamp,
+	use_time int(14) not null default 0,
+	do_address varchar(100),
+	PRIMARY KEY p_type_list (aid)
+) TYPE = innoDB COMMENT ='' default charset=utf8;

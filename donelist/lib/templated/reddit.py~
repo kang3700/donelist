@@ -1,0 +1,91 @@
+from donelist.lib.templated.templated import Templated
+from pylons import request, c, g
+from donelist.lib.utils import  UrlParser
+class Reddit(Templated):
+    '''Base class for rendering a page on reddit.  Handles toolbar creation,
+    content of the footers, and content of the corner buttons.
+
+    Constructor arguments:
+
+        space_compress -- run r2.lib.filters.spaceCompress on render
+        loginbox -- enable/disable rendering of the small login box in the right margin
+            (only if no user is logged in; login box will be disabled for a logged in user)
+        show_sidebar -- enable/disable content in the right margin
+
+            infotext -- text to display in a <p class="infotext"> above the content
+        nav_menus -- list of Menu objects to be shown in the area below the header
+        content -- renderable object to fill the main content well in the page.
+
+    settings determined at class-declaration time
+
+        create_reddit_box -- enable/disable display of the "Create a reddit" box
+        submit_box        -- enable/disable display of the "Submit" box
+        searchbox         -- enable/disable the "search" box in the header
+        extension_handling -- enable/disable rendering using non-html templates
+            (e.g. js, xml for rss, etc.)
+    '''
+
+    create_reddit_box  = True
+    submit_box         = True
+    footer             = True
+    searchbox          = True
+    extension_handling = True
+    enable_login_cover = True
+    site_tracking      = True
+    show_firsttext     = True
+    additional_css     = None
+
+    def __init__(self, space_compress = True, nav_menus = None, loginbox = True,
+                 infotext = '', content = None, title = '', robots = None, 
+                 show_sidebar = True, footer = True, srbar = True,
+                 **context):
+        Templated.__init__(self, **context)
+        self.title          = title
+        self.robots         = robots
+        self.infotext       = infotext
+        self.loginbox       = True
+        self.show_sidebar   = show_sidebar
+        self.space_compress = space_compress
+        # instantiate a footer
+        #-- self.footer         = RedditFooter() if footer else None
+
+        #put the sort menus at the top
+        #-- self.nav_menu = MenuArea(menus = nav_menus) if nav_menus else None
+
+        #add the infobar
+        self.infobar = None
+        # generate a canonical link for google
+        self.canonical_link = request.fullpath
+        if c.render_style != "html":
+            u = UrlParser(request.fullpath)
+            u.set_extension("")
+            u.hostname = g.domain
+            if g.domain_prefix:
+                u.hostname = "%s.%s" % (g.domain_prefix, u.hostname)
+            self.canonical_link = u.unparse()
+        if self.show_firsttext and not infotext:
+            if g.read_only_mode:
+                infotext = strings.read_only_msg
+            elif (c.firsttime == 'mobile_suggest' and
+                  c.render_style != 'compact'):
+                infotext = strings.iphone_first
+            elif c.firsttime and c.site.firsttext:
+                infotext = c.site.firsttext
+        #-- if infotext:
+            #-- self.infobar = InfoBar(message = infotext)
+
+        self.srtopbar = None
+
+    def render(self, *a, **kw):
+        """Overrides default Templated.render with two additions
+            * support for rendering API requests with proper wrapping
+            * support for space compression of the result
+        In adition, unlike Templated.render, the result is in the form of a pylons
+        Response object with it's content set.
+        """
+        res = Templated.render(self, *a, **kw)
+        return responsive(res, self.space_compress)
+
+  
+    def __repr__(self):
+        return "<Reddit>"

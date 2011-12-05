@@ -1,0 +1,16 @@
+1. vi /etc/mysql/my.cnf
+   在[client]下添加
+	default-character-set=utf8
+    在[mysqld]下添加
+	default-character-set=utf8
+	lower_case_table_names = 1  ###全转为小写
+2. 察看修改
+show variables like 'collation_%';
+show variables like 'character_set_%';
+
+
+00重启mysql会导致lisp连不上
+
+
+sudo apt-get install libmysqlclient-dev
+
